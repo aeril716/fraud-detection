@@ -22,3 +22,8 @@ data/
 # IDE
 .vscode/
 .idea/
+
+# Models
+models/
+*.pkl
+*.joblib

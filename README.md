@@ -1,76 +1,133 @@
 # Credit Card Fraud Detection
 
-End-to-end ML pipeline for credit card fraud detection on the [Kaggle Credit Card Fraud dataset](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud) (284,807 transactions, 0.17% fraud).
+End-to-end fraud detection pipeline on the Kaggle Credit Card dataset, focused on handling extreme class imbalance and choosing evaluation metrics that reflect real business cost.
 
-## TL;DR
+## Problem
 
-| Model | Recall | Precision | F2 | Realistic Cost |
-|:---|:---|:---|:---|:---|
-| **RF + class_weight='balanced' @ 0.3** | **0.85** | **0.92** | **0.861** | **\$16,400** ⭐ |
-| XGBoost @ 0.3 | 0.86 | 0.86 | 0.857 | \$16,870 |
-| RF + SMOTE @ 0.3 | 0.89 | 0.70 | 0.843 | \$18,400 |
-| RF (F2-tuned via GridSearchCV) @ 0.3 | 0.87 | 0.79 | 0.852 | \$17,400 |
+Credit card fraud is a needle-in-a-haystack problem: fraud accounts for only **0.17% of transactions** (492 out of 284,807). Standard classifiers optimize for accuracy, which is meaningless here — a model that predicts "no fraud" for everything scores 99.83% accuracy and catches zero fraud.
 
-**Production recommendation:** RF + class_weight='balanced' + threshold=0.3.
-Best F2 (the fraud-appropriate metric), lowest realistic cost when accounting for false-positive customer churn risk, and the simplest model.
+The real question: **how many fraud cases can we catch (recall) while keeping false alarms (precision) manageable, given the asymmetric cost of FN vs FP?**
 
-## Why this project
+## Dataset
 
-Fraud detection is a textbook imbalanced classification problem with asymmetric costs:
-- Missed fraud (FN): ~\$1,000+ direct loss
-- False alarm (FP): ~\$5 direct + ~\$200 hidden (trust erosion, churn risk)
+- **Source**: [Kaggle Credit Card Fraud Detection](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud)
+- **Size**: 284,807 transactions, 30 features
+- **Features**: 28 PCA-transformed components (`V1`–`V28`) + `Time`, `Amount`
+- **Imbalance**: 0.17% fraud rate
 
-This project explores the trade-offs between recall, precision, and realistic business cost — rather than chasing a single metric.
+## Approach
 
-## Methods
+### Models Compared
+1. Logistic Regression (baseline)
+2. Logistic Regression + `class_weight='balanced'`
+3. Random Forest
+4. XGBoost
+5. Random Forest + SMOTE
+6. Random Forest + GridSearchCV (F2-scored)
 
-### Notebook 1: Baseline (`01_baseline.ipynb`)
-- EDA: class distribution, feature correlations
-- Logistic Regression (with and without `class_weight='balanced'`)
-- RandomForest with threshold tuning (0.5 → 0.3)
+### Key Design Choices
+- **Evaluation metric**: PR-AP and F2-score over ROC-AUC and F1. ROC-AUC is optimistic on imbalanced data; F2 reflects the higher business cost of missed fraud (FN cost >> FP cost).
+- **Threshold tuning**: per-model threshold selected by F2 maximization, not default 0.5.
+- **Imbalance handling**: compared `class_weight` (loss-level) against SMOTE (data-level) head-to-head.
+- **GridSearch scorer**: F2 instead of accuracy/F1 — tuning with the wrong scorer would pull the model toward the majority class.
 
-### Notebook 2: Advanced (`02_advanced.ipynb`)
-- ROC-AUC and Precision-Recall curves
-- XGBoost with `scale_pos_weight`
-- F1 vs F2 metric comparison (F2 prioritizes recall, fitting fraud's cost asymmetry)
-- SMOTE vs `class_weight='balanced'`
-- GridSearchCV (F2-optimized hyperparameter search)
-- Feature importance analysis (RF vs XGBoost)
-- Cost simulation with hidden customer-churn costs
+## Results
 
-## Key insights
+| Model | ROC-AUC | PR-AP | F2 | Recall | Precision |
+|---|---|---|---|---|---|
+| LR baseline (thr=0.50) | 0.961 | 0.741 | 0.664 | 0.633 | 0.827 |
+| LR balanced (thr=0.20) | **0.972** | 0.719 | 0.077 | **0.939** | 0.016 |
+| **Random Forest (thr=0.30)** | 0.953 | 0.855 | **0.861** | 0.847 | **0.922** |
+| XGBoost (thr=0.82) | 0.968 | **0.880** | 0.851 | 0.837 | 0.911 |
+| RF + SMOTE (thr=0.30) | 0.968 | 0.872 | 0.843 | 0.888 | 0.702 |
+| RF tuned (GridSearch, F2) | TBD | TBD | TBD | TBD | TBD |
 
-1. **AUC and F1 alone are misleading on imbalanced data.** F2 score and direct cost simulation drive better decisions than F1 maximization.
-2. **Hyperparameter tuning didn't beat the default RF.** GridSearchCV's best params (CV F2 = 0.805) underperformed the original RF on test (F2 = 0.861). "Simpler is better" confirmed.
-3. **SMOTE wins on direct cost but loses on realistic cost.** Synthetic oversampling improves recall but inflates false positives, flipping the result once customer-churn cost is modeled.
-4. **V14 dominates feature importance in both RF and XGBoost.** XGBoost concentrates 60% on V14 alone, making it more fragile than RF for production.
-5. **Threshold meanings differ across models.** RF's 0.3 ≠ XGBoost's 0.3 — probability distributions are calibrated differently.
+**Two metrics tell different stories:**
+- **Best discrimination (PR-AP)**: XGBoost (0.880) — strongest at ranking transactions by fraud likelihood
+- **Best operating-point performance (F2)**: Random Forest at threshold 0.30 (0.861) — best practical balance under the chosen cost structure
 
-## Reproduce
+## Key Insights
+
+### 1. High AUC doesn't mean production-ready
+LR-balanced at threshold 0.20 has the highest ROC-AUC (0.972) but F2 collapses to **0.077** — precision is 1.6% (98% of flagged transactions are false alarms). This is the classic trap of evaluating imbalanced classifiers on threshold-independent metrics alone. AUC measures ranking quality, but production needs a decision rule at a specific threshold, and the threshold here destroys precision.
+
+### 2. SMOTE didn't help here
+RF + SMOTE *did* boost recall (0.847 → 0.888, +4.1pp) but precision dropped more (0.922 → 0.702, -22pp), net F2 went **down** (0.861 → 0.843). SMOTE generates synthetic minority samples through KNN interpolation, which can introduce noise near the decision boundary. The takeaway: imbalance handling is not always a win — it depends on whether the marginal recall gain outweighs the precision cost under your business metric.
+
+### 3. Simpler can win
+Random Forest with no resampling beat both XGBoost (at its F2-optimal threshold) and SMOTE-augmented RF on F2 score. XGBoost's edge in PR-AP suggests it has more headroom under different cost ratios, but for the current cost assumption (recall-weighted F2), the simpler RF is the production pick.
+
+## Business Interpretation
+
+- **FN cost (missed fraud)**: transaction value + investigation + chargeback ≈ $100–$1000+ per case
+- **FP cost (blocked legitimate transaction)**: customer friction, support load, churn risk ≈ $5–$50 per case
+- **FN cost >> FP cost** → recall-weighted metric (F2) is the right optimization target
+- Production threshold would be jointly tuned with finance based on actual cost ratio, refreshed quarterly
+
+## Tech Stack
+
+- Python 3.11+
+- pandas, numpy
+- scikit-learn (LR, RF, GridSearchCV, metrics)
+- xgboost
+- imbalanced-learn (SMOTE)
+- joblib (model persistence)
+- matplotlib, seaborn
+- `uv` for dependency management
+
+## Project Structure
+
+```
+fraud-detection/
+├── notebooks/
+│   ├── 01_baseline.ipynb       # LR, RF baseline with annotations
+│   └── 02_advanced.ipynb       # XGBoost, threshold tuning, SMOTE, GridSearch, feature importance
+├── models/                     # gitignored — generated by running 02_advanced
+├── data/
+│   └── creditcard.csv          # gitignored — download from Kaggle
+├── pyproject.toml
+├── uv.lock
+├── .gitignore
+└── README.md
+```
+
+## How to Run
 
 ```bash
+# Clone
 git clone https://github.com/aeril716/fraud-detection.git
 cd fraud-detection
 
-# Install dependencies (uv required: brew install uv)
+# Install dependencies (uv)
 uv sync
 
-# Download dataset from Kaggle and place at:
-# data/creditcard.csv
+# Download data from Kaggle into data/
+# https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud
 
 # Launch Jupyter
-uv run jupyter lab
+source .venv/bin/activate
+jupyter lab
 ```
 
-## Project structure
-fraud-detection/
-├── notebooks/
-│   ├── 01_baseline.ipynb    # EDA + LR + RF baseline
-│   └── 02_advanced.ipynb    # ROC/PR, XGBoost, SMOTE, GridSearch, Feature importance
-├── pyproject.toml           # Dependencies (uv)
-├── uv.lock                  # Locked versions
-└── .python-version          # Python 3.13
+## Production Considerations (Out of Scope, Noted for Completeness)
 
-## Tech stack
+This portfolio project focuses on the modeling cycle. A production fraud system would also need:
+- **Cost-sensitive learning**: explicit FN/FP cost ratio in the loss function (asymmetric XGBoost objective)
+- **Calibration**: Platt scaling or isotonic regression so `predict_proba` reflects true probability — necessary for cost-based threshold decisions
+- **Time-based validation**: train on past, test on future (fraud patterns drift; random split is optimistic)
+- **Segment analysis**: performance across new users, international transactions, high-value transactions, merchant categories
+- **Fairness audit**: no disparate impact across protected classes (regulatory requirement)
+- **Online deployment**: feature store integration, <100ms inference latency, shadow mode → A/B → gradual rollout
+- **Monitoring**: precision drift, feature distribution drift (V14, V12, V10), weekly fraud rate, alerting
+- **Retraining cadence**: monthly — fraud patterns evolve as attackers adapt
 
-Python 3.13 · scikit-learn · XGBoost · imbalanced-learn (SMOTE) · pandas · matplotlib · seaborn · Jupyter · uv
+## Future Work
+
+- Cost-sensitive XGBoost with explicit FN/FP cost ratio
+- Ensemble: XGBoost + Isolation Forest (supervised + unsupervised anomaly)
+- SHAP values for per-prediction explainability (dispute resolution)
+- Time-based validation experiments
+
+---
+
+*Built as part of pre-MSDS preparation (USF MS Data Science, AI track — June 2026 cohort).*
